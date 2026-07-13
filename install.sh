@@ -1,108 +1,417 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Configuration
-SCRIPT_NAME="copycat"
-SOURCE_FILE="copycat.sh"
+# ==============================================================================
+# Copycat - Streamline code packaging for LLMs or copy-pasting
+# ==============================================================================
 
-log_info()  { echo -e "\033[32m[INFO]\033[0m $*"; }
+# Global Configuration & Defaults
+DEPTH=""
+INCLUDE_JUNK=0
+USE_MARKDOWN=0
+SHOW_TREE=0
+VERBOSE=0
+ESTIMATE_TOKENS=0
+GITIGNORE_PATH=""
+PATTERNS=()
+declare -A SEEN_FILES=()
+declare -A IGNORE_PATTERNS=()
+
+# Exclusions
+JUNK_DIRS_REGEX='(^|/)\.(git|svn|hg|idea|vscode|cache|dist|build|out|node_modules|bower_components|coverage|tmp|temp|logs|__pycache__|\.mypy_cache)(/|$)'
+JUNK_EXT_REGEX='(\.(png|jpe?g|gif|webp|bmp|ico|svgz?)|(\.zip|\.tar|\.gz|\.tgz|\.bz2|\.7z|\.rar|\.xz|\.zst)|(\.pdf|\.epub|\.mobi)|(\.mp3|\.wav|\.flac|\.aac|\.ogg)|(\.mp4|\.mkv|\.webm|\.mov|\.avi)|(\.woff2?|\.ttf|\.otf)|(\.class|\.jar|\.war|\.ear)|(\.exe|\.dll|\.so|\.dylib|\.pdb))$'
+MAX_FILE_SIZE=1048576 # 1 MB in bytes
+
+# Logging Helpers (Respects VERBOSE status)
+log_info()  { [[ $VERBOSE -eq 1 ]] && echo -e "\033[32m[INFO]\033[0m $*" >&2 || true; }
+log_warn()  { [[ $VERBOSE -eq 1 ]] && echo -e "\033[33m[WARN]\033[0m $*" >&2 || true; }
 log_error() { echo -e "\033[31m[ERROR]\033[0m $*" >&2; }
 
-# Detect the user's active configuration file based on their shell environment
-detect_shell_rc() {
-    local current_shell
-    current_shell=$(basename "$SHELL")
-    
-    if [[ "$current_shell" == "zsh" ]]; then
-        echo "$HOME/.zshrc"
-    elif [[ "$current_shell" == "bash" ]]; then
-        if [[ "$OSTYPE" == "darwin"* ]]; then
-            echo "$HOME/.bash_profile"
-        else
-            echo "$HOME/.bashrc"
+usage() {
+    cat <<'EOF'
+Usage:
+  copycat [-d DEPTH] [--include-junk] [-m, --markdown] [-t, --tree] [-v, --verbose] [--tokens] [--gitignore [PATH]] [-h, --help] [glob...]
+
+Options:
+  -d DEPTH        Max recursion depth (like find -maxdepth). 0 = only current level.
+  --include-junk  Include files normally skipped (binary/large/junk types).
+  -m, --markdown  Wrap file contents in Markdown code blocks with syntax highlighting tags.
+  -t, --tree      Prepend a visual file tree of matched items at the top of the output.
+  -v, --verbose   Print progress logs (including files being processed) to stderr.
+  --tokens        Print a rough estimate of the total LLM token count to stderr.
+  --gitignore     Respect a .gitignore file to exclude paths. Optionally specify a path to one.
+  -h, --help      Show this help text.
+
+If no glob patterns are provided, the script defaults to "*" (current directory).
+EOF
+}
+
+# Simple helper to load .gitignore rules into an associative array
+load_gitignore() {
+    local path="$1"
+    if [[ -f "$path" ]]; then
+        log_info "Loading gitignore rules from: $path"
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            # Strip trailing whitespaces and carriage returns
+            line=$(echo "$line" | sed 's/[[:space:]]*$//;s/\r$//')
+            # Ignore comments and empty lines
+            [[ -z "$line" || "$line" =~ ^# ]] && continue
+            IGNORE_PATTERNS["$line"]=1
+        done < "$path"
+    else
+        log_warn "Specified gitignore file not found: $path"
+    fi
+}
+
+# Basic check to see if a file matches gitignore rules
+is_gitignored() {
+    local f="$1"
+    local rel_f="${f#"$PWD/"}"
+    for pat in "${!IGNORE_PATTERNS[@]}"; do
+        # Handle trailing slash rules for directories
+        if [[ "$pat" == */ ]]; then
+            local dir_pat="${pat%/}"
+            if [[ "$rel_f" == "$dir_pat" || "$rel_f" == "$dir_pat"/* || "/$rel_f" == */"$dir_pat"/* ]]; then
+                return 0
+            fi
+        # Standard glob match
+        elif [[ "$rel_f" == $pat || "$rel_f" == */$pat || $base_name == $pat ]]; then
+            return 0
         fi
-    else
-        echo "$HOME/.profile"
+    done
+    return 1
+}
+
+# Parse Command Line Arguments
+parse_args() {
+    while (($#)); do
+        case "$1" in
+            -d)
+                DEPTH="${2:-}"
+                if [[ -z "$DEPTH" || ! "$DEPTH" =~ ^[0-9]+$ ]]; then
+                    log_error "-d DEPTH must be a non-negative integer"
+                    exit 1
+                fi
+                shift 2
+                ;;
+            --include-junk)
+                INCLUDE_JUNK=1
+                shift
+                ;;
+            -m|--markdown)
+                USE_MARKDOWN=1
+                shift
+                ;;
+            -t|--tree)
+                SHOW_TREE=1
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=1
+                shift
+                ;;
+            --tokens)
+                ESTIMATE_TOKENS=1
+                shift
+                ;;
+            --gitignore)
+                # Check if next arg is a file path and doesn't look like a flag
+                if [[ ${2:-} != -* && -n ${2:-} ]]; then
+                    GITIGNORE_PATH="$2"
+                    shift 2
+                else
+                    GITIGNORE_PATH="$PWD/.gitignore"
+                    shift
+                fi
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                PATTERNS+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#PATTERNS[@]} -eq 0 ]]; then
+        PATTERNS=("*")
     fi
 }
 
-install_native() {
-    local bin_dir="$HOME/.local/bin"
-    local dest_path="$bin_dir/$SCRIPT_NAME"
+# Core Text Validation
+is_likely_text() {
+    local f="$1"
+    if command -v grep >/dev/null 2>&1; then
+        head -c 32768 -- "$f" 2>/dev/null | grep -I -q . && return 0 || return 1
+    fi
+    local sz
+    sz="$(wc -c < "$f" 2>/dev/null || echo 0)"
+    [[ "$sz" -lt $MAX_FILE_SIZE ]]
+}
+
+add_file_if_ok() {
+    local f="$1"
+    local bypass_junk_filter="${2:-0}"
+    local rel_f="${f#"$PWD/"}"
     
-    log_info "Installing natively to $bin_dir..."
-    mkdir -p "$bin_dir"
-    
-    cp "$SOURCE_FILE" "$dest_path"
-    chmod +x "$dest_path"
-    
-    # Check if ~/.local/bin is in the current PATH environment variable
-    if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
-        local rc_file
-        rc_file=$(detect_shell_rc)
-        log_info "Adding $bin_dir to PATH inside $rc_file..."
-        printf '\n# Added by copycat installer\nexport PATH="%s:$PATH"\n' "$bin_dir" >> "$rc_file"
-        log_info "Installation successful! Please run 'source $rc_file' or restart your terminal."
-    else
-        log_info "Installation successful! '$SCRIPT_NAME' is ready to use."
+    # Absolute safety check: Never let a directory slip into cat processing arrays
+    [[ -f "$f" ]] || return 0
+
+    if [[ -n "$GITIGNORE_PATH" ]]; then
+        if is_gitignored "$f"; then
+            log_info "Skipping gitignored file: $rel_f"
+            return 0
+        fi
+    fi
+
+    if [[ $INCLUDE_JUNK -eq 0 && $bypass_junk_filter -eq 0 ]]; then
+        if [[ "$f" =~ $JUNK_DIRS_REGEX ]]; then return 0; fi
+        if [[ "$f" =~ $JUNK_EXT_REGEX ]]; then return 0; fi
+
+        local sz
+        sz="$(wc -c < "$f" 2>/dev/null || echo 0)"
+        if [[ "$sz" -gt $MAX_FILE_SIZE ]]; then return 0; fi
+
+        if ! is_likely_text "$f"; then return 0; fi
+    fi
+
+    # Explicitly log files when verbose is active
+    log_info "Processing file: $rel_f"
+    SEEN_FILES["$f"]=1
+}
+
+maybe_traverse_match() {
+    local m="$1"
+    [[ -e "$m" ]] || return 0
+
+    local bypass_junk_filter=0
+    if [[ "$m" =~ $JUNK_DIRS_REGEX || "$m" =~ $JUNK_EXT_REGEX ]]; then
+        bypass_junk_filter=1
+    fi
+
+    if [[ -f "$m" ]]; then
+        add_file_if_ok "$m" "$bypass_junk_filter"
+        return 0
+    fi
+
+    if [[ -d "$m" ]]; then
+        if [[ $INCLUDE_JUNK -eq 0 && $bypass_junk_filter -eq 0 ]]; then
+            while IFS= read -r f; do
+                add_file_if_ok "$f" "$bypass_junk_filter"
+            done < <(
+                find "$m" \
+                    \( -type d -name ".git" \
+                    -o -name ".svn" \
+                    -o -name ".hg" \
+                    -o -name ".idea" \
+                    -o -name ".vscode" \
+                    -o -name "dist" \
+                    -o -name "build" \
+                    -o -name "out" \
+                    -o -name "node_modules" \
+                    -o -name "coverage" \
+                    -o -name "__pycache__" \
+                    -o -name ".mypy_cache" \
+                    -o -name "tmp" \
+                    -o -name "temp" \
+                    -o -name "logs" \) -prune \
+                    -o -type f -print 2>/dev/null
+            )
+        else
+            local find_args=()
+            if [[ -n "$DEPTH" ]]; then
+                find_args=(-maxdepth "$DEPTH")
+            fi
+            while IFS= read -r f; do
+                add_file_if_ok "$f" "$bypass_junk_filter"
+            done < <(find "$m" "${find_args[@]}" -type f 2>/dev/null)
+        fi
     fi
 }
 
-install_alias() {
-    local rc_file
-    rc_file=$(detect_shell_rc)
-    local absolute_src
-    absolute_src="$(cd "$(dirname "$SOURCE_FILE")" && pwd)/$SOURCE_FILE"
-    
-    log_info "Ensuring source file is executable..."
-    chmod +x "$absolute_src"
-    
-    log_info "Injecting alias into $rc_file..."
-    
-    # Check if an alias definition already exists to avoid duplicate clutter
-    if grep -q "alias $SCRIPT_NAME=" "$rc_file" 2>/dev/null; then
-        log_error "An alias for '$SCRIPT_NAME' already exists in $rc_file. Aborting to avoid conflicts."
-        exit 1
+get_lang_tag() {
+    local ext="${1##*.}"
+    if [[ "$1" != *.* ]]; then
+        echo ""
+        return
     fi
     
-    printf '\n# Added by copycat installer\nalias %s="%s"\n' "$SCRIPT_NAME" "$absolute_src" >> "$rc_file"
-    log_info "Alias configuration successful! Please run 'source $rc_file' to activate it."
+    case "${ext,,}" in
+        py) echo "python" ;;
+        js) echo "javascript" ;;
+        ts) echo "typescript" ;;
+        sh|bash|zsh) echo "bash" ;;
+        json) echo "json" ;;
+        md) echo "markdown" ;;
+        html|htm) echo "html" ;;
+        css) echo "css" ;;
+        yml|yaml) echo "yaml" ;;
+        rs) echo "rust" ;;
+        go) echo "go" ;;
+        rb) echo "ruby" ;;
+        c|h) echo "c" ;;
+        cpp|cc|hpp) echo "cpp" ;;
+        cs) echo "csharp" ;;
+        java) echo "java" ;;
+        sql) echo "sql" ;;
+        *) echo "" ;;
+    esac
+}
+
+generate_file_tree() {
+    local -A nodes=()
+    local path part accum
+    
+    while IFS= read -r path; do
+        accum="."
+        IFS='/' read -ra parts <<< "$path"
+        for part in "${parts[@]}"; do
+            if [[ "$accum" == "." ]]; then
+                accum="$part"
+            else
+                accum="$accum/$part"
+            fi
+            nodes["$accum"]=1
+        done
+    done
+    
+    printf "%s\n" "${!nodes[@]}" | sort | awk -F/ '
+    {
+        depth = NF - 1
+        indent = ""
+        for (i = 0; i < depth; i++) {
+            indent = indent "│   "
+        }
+        print indent "├── " $NF
+    }' | sed 's/├── \([^/]*\)$/└── \1/'
+}
+
+copy_to_clipboard() {
+    local infile="$1"
+    
+    if [[ $ESTIMATE_TOKENS -eq 1 ]]; then
+        local total_chars
+        total_chars=$(wc -c < "$infile")
+        # Approximate 4 characters per token calculation
+        local estimated_tokens=$((total_chars / 4))
+        echo -e "\033[34m[TOKEN ESTIMATE]\033[0m Roughly ~${estimated_tokens} tokens (${total_chars} raw bytes)" >&2
+    fi
+
+    if command -v wl-copy >/dev/null 2>&1; then
+        wl-copy < "$infile"
+        log_info "Copied to clipboard via wl-copy."
+    elif command -v pbcopy >/dev/null 2>&1; then
+        pbcopy < "$infile"
+        log_info "Copied to clipboard via pbcopy."
+    elif command -v xclip >/dev/null 2>&1; then
+        xclip -selection clipboard < "$infile"
+        log_info "Copied to clipboard via xclip."
+    else
+        [[ $VERBOSE -eq 1 ]] && log_warn "No system clipboard engine found. Printing to stdout:\n" >&2
+        cat "$infile"
+    fi
+}
+
+cleanup_tmp() {
+    if [[ -n "${OUT_TMP:-}" && -f "$OUT_TMP" ]]; then
+        rm -f "$OUT_TMP"
+    fi
 }
 
 main() {
-    # Check if the core utility script actually exists in the working directory
-    if [[ ! -f "$SOURCE_FILE" ]]; then
-        log_error "Could not find '$SOURCE_FILE' in the current directory."
-        log_error "Please run this installer from the folder where '$SOURCE_FILE' is saved."
-        exit 1
+    parse_args "$@"
+
+    if [[ -n "$GITIGNORE_PATH" ]]; then
+        load_gitignore "$GITIGNORE_PATH"
     fi
 
-    echo "=========================================="
-    echo "      Copycat CLI Tool Installer          "
-    echo "=========================================="
-    echo "How would you like to install copycat?"
-    echo ""
-    echo "1) Native Exe (Copy to ~/.local/bin without file extension - Cleanest)"
-    echo "2) Shell Alias (Inject an alias directly pointing to this absolute folder path)"
-    echo "3) Cancel"
-    echo "------------------------------------------"
-    
-    local choice
-    read -rp "Select an option [1-3]: " choice
-    echo ""
+    shopt -s globstar nullglob
 
-    case "$choice" in
-        1)
-            install_native
-            ;;
-        2)
-            install_alias
-            ;;
-        3|*)
-            log_info "Installation cancelled."
-            exit 0
-            ;;
-    esac
+    for pat in "${PATTERNS[@]}"; do
+        local matches
+        eval "matches=( $pat )" 2>/dev/null || matches=( $pat )
+        
+        if [[ ${#matches[@]} -eq 0 ]]; then
+            continue
+        fi
+        
+        for m in "${matches[@]}"; do
+            local target="$m"
+            if [[ "$m" != /* ]]; then
+                target="$PWD/$m"
+            fi
+            
+            if [[ -d "$target" ]]; then
+                target="$(cd "$target" && pwd)"
+            else
+                target="$(cd "$(dirname "$target")" && pwd)/$(basename "$target")"
+            fi
+            maybe_traverse_match "$target"
+        done
+    done
+
+    local files_sorted
+    mapfile -t files_sorted < <(
+        printf '%s\n' "${!SEEN_FILES[@]}" \
+            | sed "s|^$PWD/||" \
+            | sort
+    )
+
+    if [[ ${#files_sorted[@]} -eq 0 ]]; then
+        log_warn "No matching text files found."
+        exit 0
+    fi
+
+    global_tmp="$(mktemp)"
+    export OUT_TMP="$global_tmp"
+    trap cleanup_tmp EXIT
+
+    # Prepend Tree Structure
+    if [[ $SHOW_TREE -eq 1 ]]; then
+        if [[ $USE_MARKDOWN -eq 1 ]]; then
+            printf "### Project Directory Structure\n\`\`\`text\n.\n" >> "$OUT_TMP"
+            printf "%s\n" "${files_sorted[@]}" | generate_file_tree >> "$OUT_TMP"
+            printf "\`\`\`\n\n" >> "$OUT_TMP"
+        else
+            printf "======================================================================\n" >> "$OUT_TMP"
+            printf "DIRECTORY TREE\n" >> "$OUT_TMP"
+            printf "======================================================================\n.\n" >> "$OUT_TMP"
+            printf "%s\n" "${files_sorted[@]}" | generate_file_tree >> "$OUT_TMP"
+            printf "\n\n" >> "$OUT_TMP"
+        fi
+    fi
+
+    # Append Files
+    for rel in "${files_sorted[@]}"; do
+        local abs="$PWD/$rel"
+        [[ -f "$abs" ]] || continue
+        
+        local base
+        base="$(basename "$rel")"
+        
+        if [[ $USE_MARKDOWN -eq 1 ]]; then
+            local lang
+            lang="$(get_lang_tag "$base")"
+            {
+                printf '### %s\n' "$rel"
+                printf '\`\`\`%s\n' "$lang"
+                cat -- "$abs"
+                printf '\n\`\`\`\n\n'
+            } >> "$OUT_TMP"
+        else
+            {
+                printf '======================================================================\n'
+                printf 'FILE: %s (%s)\n' "$rel" "$base"
+                printf '======================================================================\n'
+                cat -- "$abs"
+                printf '\n\n'
+            } >> "$OUT_TMP"
+        fi
+    done
+
+    copy_to_clipboard "$OUT_TMP"
 }
 
 main "$@"
