@@ -99,6 +99,8 @@ is_likely_text() {
 add_file_if_ok() {
     local f="$1"
     local bypass_junk_filter="${2:-0}"
+    
+    # Absolute safety check: Never let a directory slip into cat processing arrays
     [[ -f "$f" ]] || return 0
 
     if [[ $INCLUDE_JUNK -eq 0 && $bypass_junk_filter -eq 0 ]]; then
@@ -225,6 +227,13 @@ copy_to_clipboard() {
     fi
 }
 
+# Clean cleanup function to avoid early string expansion errors in set -u trap definitions
+cleanup_tmp() {
+    if [[ -n "${OUT_TMP:-}" && -f "$OUT_TMP" ]]; then
+        rm -f "$OUT_TMP"
+    fi
+}
+
 main() {
     parse_args "$@"
 
@@ -239,19 +248,21 @@ main() {
         fi
         
         for m in "${matches[@]}"; do
-            # Resolve relative items safely to standard directory baselines
             local target="$m"
             if [[ "$m" != /* ]]; then
                 target="$PWD/$m"
             fi
             
-            # Normalize trailing paths for dots
-            target="$(cd "$(dirname "$target")" && pwd)/$(basename "$target")"
+            # Use safe checks to handle relative dot folders safely
+            if [[ -d "$target" ]]; then
+                target="$(cd "$target" && pwd)"
+            else
+                target="$(cd "$(dirname "$target")" && pwd)/$(basename "$target")"
+            fi
             maybe_traverse_match "$target"
         done
     done
 
-    # Filter out direct matches to original directory roots from final layout array
     local files_sorted
     mapfile -t files_sorted < <(
         printf '%s\n' "${!SEEN_FILES[@]}" \
@@ -264,29 +275,33 @@ main() {
         exit 0
     fi
 
-    # Fixed: Define the variable safely BEFORE setting up the trap statement
-    local out_tmp
-    out_tmp="$(mktemp)"
-    trap 'rm -f "$out_tmp"' EXIT
+    # Declare globally scoped tool parameters so the cleanup callback runs flawlessly
+    global_tmp="$(mktemp)"
+    export OUT_TMP="$global_tmp"
+    trap cleanup_tmp EXIT
 
     # Prepend Tree Structure if requested
     if [[ $SHOW_TREE -eq 1 ]]; then
         if [[ $USE_MARKDOWN -eq 1 ]]; then
-            printf "### Project Directory Structure\n\`\`\`text\n.\n" >> "$out_tmp"
-            printf "%s\n" "${files_sorted[@]}" | generate_file_tree >> "$out_tmp"
-            printf "\`\`\`\n\n" >> "$out_tmp"
+            printf "### Project Directory Structure\n\`\`\`text\n.\n" >> "$OUT_TMP"
+            printf "%s\n" "${files_sorted[@]}" | generate_file_tree >> "$OUT_TMP"
+            printf "\`\`\`\n\n" >> "$OUT_TMP"
         else
-            printf "======================================================================\n" >> "$out_tmp"
-            printf "DIRECTORY TREE\n" >> "$out_tmp"
-            printf "======================================================================\n.\n" >> "$out_tmp"
-            printf "%s\n" "${files_sorted[@]}" | generate_file_tree >> "$out_tmp"
-            printf "\n\n" >> "$out_tmp"
+            printf "======================================================================\n" >> "$OUT_TMP"
+            printf "DIRECTORY TREE\n" >> "$OUT_TMP"
+            printf "======================================================================\n.\n" >> "$OUT_TMP"
+            printf "%s\n" "${files_sorted[@]}" | generate_file_tree >> "$OUT_TMP"
+            printf "\n\n" >> "$OUT_TMP"
         fi
     fi
 
     # Append Files
     for rel in "${files_sorted[@]}"; do
         local abs="$PWD/$rel"
+        
+        # Double safety: skip if some rogue pattern captured a sub-directory reference
+        [[ -f "$abs" ]] || continue
+        
         local base
         base="$(basename "$rel")"
         
@@ -298,7 +313,7 @@ main() {
                 printf '\`\`\`%s\n' "$lang"
                 cat -- "$abs"
                 printf '\n\`\`\`\n\n'
-            } >> "$out_tmp"
+            } >> "$OUT_TMP"
         else
             {
                 printf '======================================================================\n'
@@ -306,11 +321,11 @@ main() {
                 printf '======================================================================\n'
                 cat -- "$abs"
                 printf '\n\n'
-            } >> "$out_tmp"
+            } >> "$OUT_TMP"
         fi
     done
 
-    copy_to_clipboard "$out_tmp"
+    copy_to_clipboard "$OUT_TMP"
 }
 
 main "$@"
