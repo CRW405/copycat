@@ -132,22 +132,39 @@ maybe_traverse_match() {
     fi
 
     if [[ -d "$m" ]]; then
-        local find_args=()
-        if [[ -n "$DEPTH" ]]; then
-            find_args=(-maxdepth "$DEPTH")
-        fi
-
+        # If we aren't bypassing filters, use a properly structured prune format
         if [[ $INCLUDE_JUNK -eq 0 && $bypass_junk_filter -eq 0 ]]; then
-            find_args+=(
-                \( -type d -name ".git" -o -name ".svn" -o -name ".hg" -o -name ".idea" -o -name ".vscode" \
-                   -o -name "dist" -o -name "build" -o -name "out" -o -name "node_modules" -o -name "coverage" \
-                   -o -name "__pycache__" -o -name ".mypy_cache" -o -name "tmp" -o -name "temp" -o -name "logs" \) -prune -false
+            while IFS= read -r f; do
+                add_file_if_ok "$f" "$bypass_junk_filter"
+            done < <(
+                find "$m" \
+                    \( -type d -name ".git" \
+                    -o -name ".svn" \
+                    -o -name ".hg" \
+                    -o -name ".idea" \
+                    -o -name ".vscode" \
+                    -o -name "dist" \
+                    -o -name "build" \
+                    -o -name "out" \
+                    -o -name "node_modules" \
+                    -o -name "coverage" \
+                    -o -name "__pycache__" \
+                    -o -name ".mypy_cache" \
+                    -o -name "tmp" \
+                    -o -name "temp" \
+                    -o -name "logs" \) -prune \
+                    -o -type f -print 2>/dev/null
             )
+        else
+            # If tracking everything, run a vanilla find pass
+            local find_args=()
+            if [[ -n "$DEPTH" ]]; then
+                find_args=(-maxdepth "$DEPTH")
+            fi
+            while IFS= read -r f; do
+                add_file_if_ok "$f" "$bypass_junk_filter"
+            done < <(find "$m" "${find_args[@]}" -type f 2>/dev/null)
         fi
-
-        while IFS= read -r f; do
-            add_file_if_ok "$f" "$bypass_junk_filter"
-        done < <(find "$m" "${find_args[@]}" -type f 2>/dev/null)
     fi
 }
 
