@@ -30,7 +30,7 @@ log_error() { echo -e "\033[31m[ERROR]\033[0m $*" >&2; }
 usage() {
     cat <<'EOF'
 Usage:
-  copycat [-d DEPTH] [--include-junk] [-m, --markdown] [-t, --tree] [-v, --verbose] [--tokens] [--gitignore] [--gitignore-file PATH] [-h, --help] [glob...]
+  copycat [-d DEPTH] [--include-junk] [-m, --markdown] [-t, --tree] [-v, --verbose] [--tokens] [--gitignore] [--gitignore-file PATH] [--ignore PATTERN] [-h, --help] [glob...]
 
 Options:
   -d DEPTH        Max recursion depth (like find -maxdepth). 0 = only current level.
@@ -42,6 +42,9 @@ Options:
   --gitignore     Respect ./.gitignore to exclude paths.
   --gitignore-file PATH
                   Respect the specified .gitignore-style file to exclude paths.
+  --ignore PATTERN
+                  Manually exclude files or directories using a gitignore-style pattern
+                  (e.g., --ignore "*/ignoreme.txt" or --ignore "*/ignore/*").
   -h, --help      Show this help text.
 
 If no glob patterns are provided, the script defaults to "*" (current directory).
@@ -62,7 +65,7 @@ load_gitignore() {
     fi
 }
 
-is_gitignored() {
+is_ignored() {
     local f="$1"
     local rel_f="${f#"$PWD/"}"
     local base_name
@@ -132,6 +135,14 @@ parse_args() {
                 GITIGNORE_PATH="$2"
                 shift 2
                 ;;
+            --ignore)
+                if [[ -z "${2:-}" || "${2:-}" == -* ]]; then
+                    log_error "--ignore requires a pattern argument"
+                    exit 1
+                fi
+                IGNORE_PATTERNS["$2"]=1
+                shift 2
+                ;;
             -h|--help)
                 usage
                 exit 0
@@ -164,11 +175,10 @@ add_file_if_ok() {
 
     [[ -f "$f" ]] || return 0
 
-    if [[ -n "$GITIGNORE_PATH" ]]; then
-        if is_gitignored "$f"; then
-            log_info "Skipping gitignored file: $f"
-            return 0
-        fi
+    # This handles both explicit --ignore flags and standard .gitignore files
+    if is_ignored "$f"; then
+        log_info "Skipping ignored file: $f"
+        return 0
     fi
 
     if [[ $INCLUDE_JUNK -eq 0 && $bypass_junk_filter -eq 0 ]]; then
@@ -190,9 +200,12 @@ maybe_traverse_match() {
     local m="$1"
     [[ -e "$m" ]] || return 0
 
+    # Extract relative path to avoid false positives from parent folders (like /tmp)
+    local rel_m="${m#"$PWD/"}"
+
     # If it's known junk and we aren't forcing junk inclusion, skip it entirely
     if [[ $INCLUDE_JUNK -eq 0 ]]; then
-        if [[ "$m" =~ $JUNK_DIRS_REGEX || "$m" =~ $JUNK_EXT_REGEX ]]; then
+        if [[ "$rel_m" =~ $JUNK_DIRS_REGEX || "$m" =~ $JUNK_EXT_REGEX ]]; then
             log_info "Skipping junk path: $m"
             return 0
         fi
@@ -340,8 +353,7 @@ main() {
     shopt -s globstar nullglob
 
     for pat in "${PATTERNS[@]}"; do
-        local matches
-        eval "matches=( $pat )" 2>/dev/null || matches=( $pat )
+        local matches=($pat)
 
         if [[ ${#matches[@]} -eq 0 ]]; then
             continue
@@ -389,7 +401,7 @@ main() {
         fi
     fi
 
-# Append Files
+    # Append Files
     for abs in "${files_sorted[@]}"; do
         [[ -f "$abs" ]] || continue
         local base
