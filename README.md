@@ -26,3 +26,13 @@ If the installer updates your shell config, reload it (or restart your terminal)
 source ~/.bashrc   # Linux bash
 source ~/.zshrc    # zsh
 ```
+
+## Uninstall
+
+### If installed as native command
+
+rm ~/.local/bin/copycat
+
+### If installed as alias
+
+Edit your shell source and remove the added alias line. 
