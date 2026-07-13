@@ -18,7 +18,7 @@ declare -A SEEN_FILES=()
 declare -A IGNORE_PATTERNS=()
 
 # Exclusions
-JUNK_DIRS_REGEX='(^|/)\.(git|svn|hg|idea|vscode|cache|dist|build|out|node_modules|bower_components|coverage|tmp|temp|logs|__pycache__|\.mypy_cache)(/|$)'
+JUNK_DIRS_REGEX='(^|/)(\.git|\.svn|\.hg|\.idea|\.vscode|\.cache|dist|build|out|node_modules|bower_components|coverage|tmp|temp|logs|__pycache__|\.mypy_cache|CMakeFiles)(/|$)'
 JUNK_EXT_REGEX='(\.(png|jpe?g|gif|webp|bmp|ico|svgz?)|(\.zip|\.tar|\.gz|\.tgz|\.bz2|\.7z|\.rar|\.xz|\.zst)|(\.pdf|\.epub|\.mobi)|(\.mp3|\.wav|\.flac|\.aac|\.ogg)|(\.mp4|\.mkv|\.webm|\.mov|\.avi)|(\.woff2?|\.ttf|\.otf)|(\.class|\.jar|\.war|\.ear)|(\.exe|\.dll|\.so|\.dylib|\.pdb))$'
 MAX_FILE_SIZE=1048576 # 1 MB in bytes
 
@@ -190,13 +190,16 @@ maybe_traverse_match() {
     local m="$1"
     [[ -e "$m" ]] || return 0
 
-    local bypass_junk_filter=0
-    if [[ "$m" =~ $JUNK_DIRS_REGEX || "$m" =~ $JUNK_EXT_REGEX ]]; then
-        bypass_junk_filter=1
+    # If it's known junk and we aren't forcing junk inclusion, skip it entirely
+    if [[ $INCLUDE_JUNK -eq 0 ]]; then
+        if [[ "$m" =~ $JUNK_DIRS_REGEX || "$m" =~ $JUNK_EXT_REGEX ]]; then
+            log_info "Skipping junk path: $m"
+            return 0
+        fi
     fi
 
     if [[ -f "$m" ]]; then
-        add_file_if_ok "$m" "$bypass_junk_filter"
+        add_file_if_ok "$m" 0
         return 0
     fi
 
@@ -206,9 +209,9 @@ maybe_traverse_match() {
             depth_args=(-maxdepth "$DEPTH")
         fi
 
-        if [[ $INCLUDE_JUNK -eq 0 && $bypass_junk_filter -eq 0 ]]; then
+        if [[ $INCLUDE_JUNK -eq 0 ]]; then
             while IFS= read -r f; do
-                add_file_if_ok "$f" "$bypass_junk_filter"
+                add_file_if_ok "$f" 0
             done < <(
                 find "$m" "${depth_args[@]}" \
                     \( -mindepth 1 -type d \
@@ -224,6 +227,7 @@ maybe_traverse_match() {
                     -o -name "coverage" \
                     -o -name "__pycache__" \
                     -o -name ".mypy_cache" \
+                    -o -name "CMakeFiles" \
                     -o -name "tmp" \
                     -o -name "temp" \
                     -o -name "logs" \) -prune \) \
@@ -231,7 +235,7 @@ maybe_traverse_match() {
             )
         else
             while IFS= read -r f; do
-                add_file_if_ok "$f" "$bypass_junk_filter"
+                add_file_if_ok "$f" 1
             done < <(find "$m" "${depth_args[@]}" -type f 2>/dev/null)
         fi
     fi
@@ -385,7 +389,7 @@ main() {
         fi
     fi
 
-    # Append Files
+# Append Files
     for abs in "${files_sorted[@]}"; do
         [[ -f "$abs" ]] || continue
         local base
@@ -396,9 +400,9 @@ main() {
             lang="$(get_lang_tag "$base")"
             {
                 printf '### %s\n' "$abs"
-                printf '\`\`\`%s\n' "$lang"
+                printf '```%s\n' "$lang"
                 cat -- "$abs"
-                printf '\n\`\`\`\n\n'
+                printf '\n```\n\n'
             } >> "$OUT_TMP"
         else
             {
