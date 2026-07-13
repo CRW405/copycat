@@ -27,7 +27,7 @@ log_error() { echo -e "\033[31m[ERROR]\033[0m $*" >&2; }
 usage() {
     cat <<'EOF'
 Usage:
-  copycat.sh [-d DEPTH] [--include-junk] [-m, --markdown] [-t, --tree] [-v, --verbose] [-h, --help] [glob...]
+  copycat [-d DEPTH] [--include-junk] [-m, --markdown] [-t, --tree] [-v, --verbose] [-h, --help] [glob...]
 
 Options:
   -d DEPTH        Max recursion depth (like find -maxdepth). 0 = only current level.
@@ -101,7 +101,6 @@ add_file_if_ok() {
     local bypass_junk_filter="${2:-0}"
     [[ -f "$f" ]] || return 0
 
-    # Only apply block filters if we aren't explicitly bypassing them for this target branch
     if [[ $INCLUDE_JUNK -eq 0 && $bypass_junk_filter -eq 0 ]]; then
         if [[ "$f" =~ $JUNK_DIRS_REGEX ]]; then return 0; fi
         if [[ "$f" =~ $JUNK_EXT_REGEX ]]; then return 0; fi
@@ -120,7 +119,6 @@ maybe_traverse_match() {
     local m="$1"
     [[ -e "$m" ]] || return 0
 
-    # Determine if this item was explicitly asked for despite matching junk patterns
     local bypass_junk_filter=0
     if [[ "$m" =~ $JUNK_DIRS_REGEX || "$m" =~ $JUNK_EXT_REGEX ]]; then
         bypass_junk_filter=1
@@ -137,7 +135,6 @@ maybe_traverse_match() {
             find_args=(-maxdepth "$DEPTH")
         fi
 
-        # Only prune junk folders down-tree if we aren't explicitly targeting one right now
         if [[ $INCLUDE_JUNK -eq 0 && $bypass_junk_filter -eq 0 ]]; then
             find_args+=(
                 \( -type d -name ".git" -o -name ".svn" -o -name ".hg" -o -name ".idea" -o -name ".vscode" \
@@ -242,14 +239,19 @@ main() {
         fi
         
         for m in "${matches[@]}"; do
-            if [[ "$m" = /* ]]; then
-                maybe_traverse_match "$m"
-            else
-                maybe_traverse_match "$PWD/$m"
+            # Resolve relative items safely to standard directory baselines
+            local target="$m"
+            if [[ "$m" != /* ]]; then
+                target="$PWD/$m"
             fi
+            
+            # Normalize trailing paths for dots
+            target="$(cd "$(dirname "$target")" && pwd)/$(basename "$target")"
+            maybe_traverse_match "$target"
         done
     done
 
+    # Filter out direct matches to original directory roots from final layout array
     local files_sorted
     mapfile -t files_sorted < <(
         printf '%s\n' "${!SEEN_FILES[@]}" \
@@ -262,6 +264,7 @@ main() {
         exit 0
     fi
 
+    # Fixed: Define the variable safely BEFORE setting up the trap statement
     local out_tmp
     out_tmp="$(mktemp)"
     trap 'rm -f "$out_tmp"' EXIT
