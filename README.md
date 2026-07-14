@@ -27,6 +27,14 @@ source ~/.bashrc   # Linux bash
 source ~/.zshrc    # zsh
 ```
 
+## Use
+
+Consult:
+```bash
+copycat -h
+```
+for use.
+
 ## Uninstall
 
 ### If installed as native command
